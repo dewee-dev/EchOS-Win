@@ -176,6 +176,14 @@ class LicenseService {
   /// 不通，2026-10-10 TUN 提权实测踩中）。时间戳为空的断网（从未激活 /
   /// 上次结论已是否定）照拦——「吊销后拔网线重启绕过拦截」从这儿走不通：
   /// 吊销结论落地的那一刻时间戳就被清了。
+  
+  static const bool _devNoLicenseFlag =
+    bool.fromEnvironment('ECHOS_DEV_NO_LICENSE', defaultValue: kDebugMode);
+static bool get devNoLicense => _devNoLicenseFlag && kDebugMode;
+static bool get enabled => baseUrl.trim().isNotEmpty && !devNoLicense;
+
+  
+  
   bool get blocked =>
       _stage != LicenseStage.active &&
       _stage != LicenseStage.notConfigured &&
