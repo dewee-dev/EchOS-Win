@@ -19,8 +19,13 @@ class SelfCheckResult {
 
 class SelfCheck {
   /// 完整自检（代理运行中）
+  /// [globalMode] = 全局分流模式：所有流量都走隧道，国内站点是「绕道国外
+  /// 出口再回国内」的访问路径，4 秒超时是常态——百度探针在这个模式下
+  /// 测不出任何有意义的东西（2026-10-18 定稿：全局模式直接跳过国内探针，
+  /// 不再产出误导性的 ✗；方案A 的「国内探针失败不红灯」只覆盖分流模式）。
   static Future<List<SelfCheckResult>> run(
-      {required ({String host, int port}) socks}) async {
+      {required ({String host, int port}) socks, bool globalMode = false,
+      bool Function()? shouldAbort}) async {
     final results = <SelfCheckResult>[];
 
     // 本地端口
@@ -32,23 +37,26 @@ class SelfCheck {
     if (!portOK) return results;
 
     // 国内/国外探针并行（超时 4s ×最多3次），网络波动时不再串行叠加 60s+
+    // 全局模式只测隧道——国内探针在该模式下无意义（见上方 globalMode 注释）。
     final probes = await Future.wait<({bool ok, double cost, String note})>([
-      _probeRobust(socks, 'https://www.baidu.com', 4),
+      if (!globalMode) _probeRobust(socks, 'https://www.baidu.com', 4, shouldAbort: shouldAbort) else Future.value((ok: true, cost: 0.0, note: '全局模式跳过')),
       _probeAnyRobust(socks, [
         'https://www.gstatic.com/generate_204',
         'https://cp.cloudflare.com/generate_204',
-      ], 4),
+      ], 4, shouldAbort: shouldAbort),
     ]);
-    final cn = probes[0];
-    results.add(SelfCheckResult(
-        '国内网站（百度）',
-        cn.ok,
-        cn.ok
-            ? '${(cn.cost * 1000).round()} 毫秒'
-            : '失败：${cn.note}'));
+    if (!globalMode) {
+      final cn = probes.first;
+      results.add(SelfCheckResult(
+          '国内网站（百度）',
+          cn.ok,
+          cn.ok
+              ? '${(cn.cost * 1000).round()} 毫秒'
+              : '失败：${cn.note}'));
+    }
 
-    final fns = probes[1];
-    results.add(SelfCheckResult('国外网站（经隧道）', fns.ok,
+    final fns = probes.last;
+    results.add(SelfCheckResult('③ 可访问 Google（经隧道）', fns.ok,
         fns.ok ? '${fns.note} · 隧道正常' : '失败：${fns.note}',
         dependsOnTunnel: true));
 
@@ -70,7 +78,7 @@ class SelfCheck {
     // 只接受 ECH 加密握手，裸 TLS 握手在 TLS 阶段就被服务端拒绝（reset），
     // 但那不代表服务器不可用（内核用 ECH 连能正常跑）。
     final tcp = await _tcpCheck(serverHost, cfg.serverPort, 4);
-    results.add(SelfCheckResult('服务器地址', tcp.ok,
+    results.add(SelfCheckResult('① 服务器地址可达', tcp.ok,
         tcp.ok ? 'TCP 端口可达（${cfg.serverPort}）' : tcp.note));
 
     // 2) Token 鉴权：仅当服务器接受标准 TLS 握手时才有意义（普通 CF Worker，
@@ -81,19 +89,19 @@ class SelfCheck {
         final ws = await tokenHandshakeCheck(
             serverHost, cfg.serverPort, cfg.token, 4);
         results.add(SelfCheckResult(
-            'Token鉴权', ws.ok, ws.ok ? '服务端验证通过' : ws.note));
+            '② TOKEN 校验', ws.ok, ws.ok ? '通过' : ws.note));
       } else {
         // 对齐 Mac：标准握手 banner 失败 → 该项判红并说明（可能是 ECH-only，
         // 无法完成标准预检），不再默认为“跳过、正常”。
         results.add(const SelfCheckResult(
-            'Token鉴权', false, '服务器未返回标准握手标识（可能是 ECH-only，无法标准预检）'));
+            '② TOKEN 校验', false, '服务端未返回标准握手标识（ECH-only，无法预检，以启动后自检为准）'));
       }
     }
 
     final doh = _dohHost(ServerConfig.normalizedDoH(cfg.dns));
     if (doh != null) {
       final d = await _tcpCheck(doh, 443, 4);
-      results.add(SelfCheckResult('DoH 服务器 $doh', d.ok,
+      results.add(SelfCheckResult('DoH 服务器可达（$doh）', d.ok,
           d.ok ? '${(d.cost * 1000).round()} 毫秒' : '失败：${d.note}'));
     } else {
       results.add(const SelfCheckResult(
@@ -201,24 +209,32 @@ class SelfCheck {
   }
 
   static Future<({bool ok, double cost, String note})> _probeRobust(
-      ({String host, int port}) socks, String url, int timeout) async {
+      ({String host, int port}) socks, String url, int timeout,
+      {bool Function()? shouldAbort}) async {
     var last = await _probe(socks, url, timeout);
     if (last.ok) return last;
+    // 认证已被服务端拒绝（TOKEN 错）→ 重试注定失败，立即返回。
+    // 没有这个短路，错 TOKEN 的自检要傻等 3×4s×2 探针 + 6s 重试 ≈ 一分钟。
+    if (shouldAbort != null && shouldAbort()) return last;
     await Future.delayed(const Duration(seconds: 1));
     last = await _probe(socks, url, timeout);
     if (last.ok) return last;
+    if (shouldAbort != null && shouldAbort()) return last;
     await Future.delayed(const Duration(seconds: 3));
     last = await _probe(socks, url, timeout);
     return last;
   }
 
   static Future<({bool ok, double cost, String note})> _probeAnyRobust(
-      ({String host, int port}) socks, List<String> urls, int timeout) async {
+      ({String host, int port}) socks, List<String> urls, int timeout,
+      {bool Function()? shouldAbort}) async {
     final first = await _probeAny(socks, urls, timeout);
     if (first.ok) return first;
+    if (shouldAbort != null && shouldAbort()) return first;
     await Future.delayed(const Duration(seconds: 1));
     final second = await _probeAny(socks, urls, timeout);
     if (second.ok) return second;
+    if (shouldAbort != null && shouldAbort()) return second;
     await Future.delayed(const Duration(seconds: 3));
     final third = await _probeAny(socks, urls, timeout);
     return third;

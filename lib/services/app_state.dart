@@ -391,6 +391,13 @@ class AppState extends ChangeNotifier {
       _log('[系统] 授权未通过，已阻止启动代理内核');
       return;
     }
+    // 认证失败爆发回调（2026-10-17 用户拍板）：内核运行中服务端持续拒绝时，
+    // 不自己弹窗（会跟自检失败弹窗背靠背重复，2026-10-17 用户实测两连弹），
+    // 而是立即触发一次自检——确认+关停+归因弹窗全部由自检那一条链负责。
+    KernelManager.instance.onAuthFailureBurst = () {
+      _log('[系统] 检测到服务端持续拒绝认证，立即复检…');
+      runSelfCheck(silent: true);
+    };
     final s = selected;
     if (s == null) {
       notify('请先新增一个服务器');
@@ -400,6 +407,20 @@ class AppState extends ChangeNotifier {
     if (err != null) {
       notify(err);
       return;
+    }
+    // Token 预检（2026-10-17 用户要求「校验逻辑放最前面」）：内核起来之前先用
+    // 最小握手对一次 TOKEN——不一致就直接弹窗拦下，不让内核带着错 TOKEN
+    // 起来之后每条连接 401（那种失败只进 kernel.log，用户看不到直接原因）。
+    // 只拦「服务端明确回 401/403」；ECH-only/网络握不上的情形不拦，交还给
+    // 内核自己的路径（预检握不上不代表内核握不上）。服务器地址/DoH 的预检
+    // 结果这里不拦（信息展示用），内核路径有自己的归因弹窗。
+    final pf = await SelfCheck.runPreflight(s);
+    for (final r in pf) {
+      if (r.title == '② TOKEN 校验' && !r.ok && r.note.contains('不一致')) {
+        checkState = const CheckState.failed('Token鉴权：与服务端TOKEN不一致');
+        notify('TOKEN 与服务端不一致。请核对 TOKEN 后重新启动。', title: '启动失败');
+        return;
+      }
     }
     final saved = _saved[s.id];
     if (saved == null || !_equal(s, saved)) {
@@ -484,6 +505,21 @@ class AppState extends ChangeNotifier {
         pid: KernelManager.instance.pendingConflict!.pid,
       );
       _refreshStatusText();
+      notifyListeners();
+      return;
+    }
+
+    // 启动看门（方案一）：内核启动窗口内收到服务端 401（TOKEN 明确被拒）→
+    // 不再等端口、不进自检，立即停内核并弹窗。错 TOKEN 的反馈从 ~60s 缩到 ~10s。
+    if (KernelManager.instance.startupAuthFailed != null) {
+      isStarting = false;
+      _refreshStatusText();
+      await KernelManager.instance.stop();
+      // failed 判定必须放在 stop() 之后：stop 的 finally 会把灯重置为 idle，
+      // 先设后停 = 灯变灰、弹窗说失败，又是一组自相矛盾的状态（2026-10-18 终审自查）。
+      checkState = const CheckState.failed('TOKEN 与服务器端不一致');
+      _refreshStatusText();
+      notify('TOKEN 与服务器端不一致。\n请核对 TOKEN 后重新启动。', title: '启动失败');
       notifyListeners();
       return;
     }
@@ -1022,12 +1058,16 @@ class AppState extends ChangeNotifier {
     // 一次性消费「启动后自检」标记：只有这轮真的在测运行中的代理才可能关代理。
     final closeOnFail = _autoStartCheckCloses;
     _autoStartCheckCloses = false;
+    // 认证失败爆发检查点：内核运行中服务端持续拒绝时，这里（自检周期）补一次提示。
+    KernelManager.instance.reportAuthBurstIfNeeded();
 
     List<SelfCheckResult> results;
     final s = selected;
     final socks = KernelManager.instance.activeSocks;
     if (socks != null && isRunning) {
-      results = await SelfCheck.run(socks: socks);
+      results = await SelfCheck.run(
+          socks: socks, globalMode: config.routeMode == RouteMode.global,
+          shouldAbort: () => KernelManager.instance.authFailedRecently());
     } else if (s != null) {
       final err = s.validate();
       if (err != null) {
@@ -1083,6 +1123,13 @@ class AppState extends ChangeNotifier {
     // 留着内核跑 —— 否则下次启动撞端口占用，界面状态也对不上。
     if (proxyTakenOver) {
       _log('[系统] 隧道自检失败，为避免浏览器全挂，正在关闭代理…');
+      // 这里以前没有弹窗：代理「已接管」后的自检失败是无声关停，
+      // 用户只能滑日志找原因（2026-10-17 实测）。归因后弹一次。
+      final hint = KernelManager.instance.serverFailureHint();
+      notify(hint == null
+          ? '隧道自检失败，已停止代理。请检查服务器配置后再启动。'
+          : '$hint。请核对后重新启动。',
+          title: '启动失败');
       await stop();
     } else if (closeOnFail && isRunning) {
       // 启动/切换后自动跑的那次自检失败：内核刚起来（端口已就绪）但隧道不通，
@@ -1090,6 +1137,19 @@ class AppState extends ChangeNotifier {
       // 原逻辑不会关代理 → 会一直挂着个死代理。这里必须关掉。
       // 但服务端约 30s 掐断空闲通道：探针恰逢重建窗口会误判“隧道不通”，
       // 先等一个重建周期（6s）重试一次，仍失败才按启动失败关闭。
+      // 认证失败（TOKEN 明确被拒）不存在「重建窗口自愈」——6s 重试跳过，
+      // 立即关停 + 归因弹窗（2026-10-18 用户方案：错 TOKEN 别让用户等一分钟）。
+      if (KernelManager.instance.authFailedRecently()) {
+        _log('[系统] 认证失败（TOKEN 与服务端不一致），跳过重试，正在关闭代理…');
+        await stop();
+        final hintA = KernelManager.instance.serverFailureHint();
+        notify(hintA == null
+            ? 'TOKEN 与服务端不一致。\n已停止代理，请核对后重新启动。'
+            : '$hintA。\n已停止代理，请核对后重新启动。',
+            title: '启动失败');
+        notifyListeners();
+        return;
+      }
       _log('[系统] 自检未通过，等 6s 重建窗口后重试…');
       await Future.delayed(const Duration(seconds: 6));
       if (!isRunning) {
@@ -1099,11 +1159,18 @@ class AppState extends ChangeNotifier {
       final ros = KernelManager.instance.activeSocks;
       if (ros == null) {
         await stop();
-        notify('服务器连接失败，已停止代理。请检查服务器配置后再启动。',
+        // 归因弹窗：内核日志尾部能识别出直接原因（如 TOKEN 不一致）就说原因，
+        // 识别不出才回退笼统提示（2026-10-17 用户反馈：滑日志找直接原因太难）。
+        final hint = KernelManager.instance.serverFailureHint();
+        notify(hint == null
+            ? '服务器连接失败，已停止代理。请检查服务器配置后再启动。'
+            : '$hint。请核对后重新启动。',
             title: '启动失败');
         return;
       }
-      final retry = await SelfCheck.run(socks: ros);
+      final retry = await SelfCheck.run(
+          socks: ros, globalMode: config.routeMode == RouteMode.global,
+          shouldAbort: () => KernelManager.instance.authFailedRecently());
       final tunnelOk = !retry.any((r) => r.dependsOnTunnel && !r.ok);
       if (tunnelOk) {
         _log('[系统] 重试自检通过，代理继续运行');
@@ -1113,7 +1180,10 @@ class AppState extends ChangeNotifier {
       }
       _log('[系统] 代理启动失败（服务器连接不通），正在关闭代理…');
       await stop();
-      notify('服务器连接失败，已停止代理。请检查服务器配置后再启动。',
+      final hint = KernelManager.instance.serverFailureHint();
+      notify(hint == null
+          ? '服务器连接失败，已停止代理。请检查服务器配置后再启动。'
+          : '$hint。请核对后重新启动。',
           title: '启动失败');
     }
   }

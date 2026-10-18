@@ -197,6 +197,10 @@ class KernelManager {
         tun: tun);
 
     isStarting = true;
+    _authFailures.clear();
+    _authBurstReported = false; // 每次内核运行只报一次认证失败爆发
+    startupAuthFailed = null;
+    _kernelStartedAt = DateTime.now();
     log('[系统] 正在启动内核进程…');
     if (tun) {
       log('[系统] TUN 模式：内核将创建虚拟网卡接管全部流量（不再设置系统代理）');
@@ -266,6 +270,12 @@ class KernelManager {
     final maxAttempts = tun ? 90 : 25;
     for (var attempt = 1; attempt <= maxAttempts; attempt++) {
       if (!isStarting || !_processAlive) {
+        isStarting = false;
+        return;
+      }
+      // 方案一看门：服务端已明确拒绝 TOKEN——后续的端口等待/自检全是白跑，
+      // 立即交还 start() 去停内核 + 弹窗（错 TOKEN 的弹窗从 ~60s 缩到 ~10s）。
+      if (startupAuthFailed != null) {
         isStarting = false;
         return;
       }
@@ -430,10 +440,60 @@ class KernelManager {
 
   // ---- 失败归因（对齐 Mac serverFailureHint）：记住最近 30 行内核日志 ----
   final List<String> _lastLines = [];
+  // 认证失败聚合（2026-10-17 用户拍板）：内核输出里出现「认证失败」的时间戳。
+  // 60 秒内 ≥3 条说明服务端在持续拒绝（TOKEN 改了/服务端侧变化），而不是单次
+  // 抖动——AppState 据此弹一次提示（onAuthFailureBurst，每次内核运行只报一次）。
+  final List<DateTime> _authFailures = [];
+  // 启动看门（方案一，2026-10-17 用户拍板）：内核启动窗口内出现首条「认证失败」
+  // （服务端对 WebSocket 握手明确回 401/403）→ 立即判决 TOKEN 错误，不等端口、
+  // 不进自检。401 是服务端明确拒绝而非网络抖动，零误伤（TOKEN 对就没有 401）。
+  String? startupAuthFailed;
+  DateTime? _kernelStartedAt;
+  bool _authBurstReported = false;
+  /// 60 秒窗口内的认证失败条数（供自检/诊断读取）。
+  int authFailuresInLastMinute() {
+    final cutoff = DateTime.now().subtract(const Duration(seconds: 60));
+    return _authFailures.where((t) => t.isAfter(cutoff)).length;
+  }
+  /// 认证失败爆发回调：每次内核运行至多触发一次，start() 时复位。
+  void Function()? onAuthFailureBurst;
+  /// 近期是否发生过认证失败（启动看门旗或 60s 内 ≥3 条）——
+  /// 供自检探针短路重试、供关停路径跳过重建窗等待。TOKEN 被拒不存在自愈。
+  bool authFailedRecently() =>
+      startupAuthFailed != null || authFailuresInLastMinute() >= 3;
+
+  /// 供外部检查点调用：带「只报一次」守卫（直接调回调会绕过它）。
+  void reportAuthBurstIfNeeded() {
+    if (_authBurstReported) return;
+    if (authFailuresInLastMinute() < 3) return;
+    // 启动后 45 秒内是自动自检的管辖范围（错 TOKEN 会在那里被拦下并弹窗），
+    // 聚合器在这个窗口发声会跟自检弹窗背靠背重复（2026-10-17 用户实测两连弹）。
+    final startedAt = _kernelStartedAt;
+    if (startedAt != null &&
+        DateTime.now().difference(startedAt) < const Duration(seconds: 45)) {
+      return;
+    }
+    _authBurstReported = true;
+    try { onAuthFailureBurst?.call(); } catch (_) {}
+  }
 
   void _remember(String l) {
     _lastLines.add(l);
     if (_lastLines.length > 30) _lastLines.removeAt(0);
+    if (l.contains('认证失败')) {
+      _authFailures.add(DateTime.now());
+      if (_authFailures.length > 200) _authFailures.removeRange(0, _authFailures.length - 200);
+      // 启动窗口：首条 401 即判决（内核横幅后 ~4s 落地），不等端口/自检。
+      if (isStarting && startupAuthFailed == null) {
+        startupAuthFailed = 'TOKEN 与服务器端不一致';
+      }
+      // 运行期（服务端中途开始拒绝）：聚合计数，≥3 条/60s 触发一次回调
+      //（回调=立即自检，弹窗由自检失败链负责——避免两连弹）。
+      if (!isStarting && !_authBurstReported && authFailuresInLastMinute() >= 3) {
+        _authBurstReported = true;
+        try { onAuthFailureBurst?.call(); } catch (_) {}
+      }
+    }
   }
 
   /// 把内核日志落盘到 logs/kernel.log（超过 kernelLogMaxBytes 轮转到

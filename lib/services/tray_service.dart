@@ -29,12 +29,19 @@ class TrayService with TrayListener {
   ///
   /// ★ 托盘变蓝的时机（用户拍板）：**自检通过之后**，与主灯同步——
   ///   顺序是 运行绿(灯)→自检黄(灯)→托盘蓝+灯绿。接管了但自检还没过/
-  ///   自检失败的窗口里，托盘保持橙：那时代理虽然"接管了"，隧道质量
+  ///   自检未完成的窗口里，托盘保持橙：那时代理虽然"接管了"，隧道质量
   ///   未证实，蓝图标是对外的"一切正常"承诺，不能提前给。
-  ///   自检失败（tunProbeFailed）时代理会被自动关停，_proxyActive
-  ///   自然回落，无需在此单列。
+  ///   自检失败（隧道探针也不通）时代理会被自动关停，_proxyActive
+  ///   自然回落，无需在此单列。只有国内探针失败、隧道探针通过时，
+  ///   与灯色一致判蓝（见下方方案A对齐注释，2026-10-17）。
+  // 与灯色判据（方案A）对齐（2026-10-17 用户报三态打架：运行绿灯+自检失败+托盘橙）：
+  // 隧道探针通过时国内探针失败只是质量注记（baidu 经隧道绕道超时≠代理没生效），
+  // 托盘不该比灯更严——不然灯绿托盘橙，用户不知道该信哪个。
   bool get _proxyActive =>
-      (_app.proxyReady || _app.tunActive) && _app.checkState.kind == CheckStateKind.ok;
+      (_app.proxyReady || _app.tunActive) &&
+      (_app.checkState.kind == CheckStateKind.ok ||
+          (_app.checkState.kind == CheckStateKind.failed &&
+              !_app.checkState.tunProbeFailed));
 
   Future<void> init() async {
     await _writeIcons();
