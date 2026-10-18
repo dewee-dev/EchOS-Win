@@ -99,6 +99,7 @@ Temp/
 license-server/
 
 # wrangler 本地运行/部署缓存
+.wrangler/
 worker/.wrangler/
 
 # ===== 本地文档归档：不进 GitHub（用户拍板 2026-10-08） =====

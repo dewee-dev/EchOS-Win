@@ -39,6 +39,17 @@ class WebDAVError {
   WebDAVError(this.message);
 }
 
+/// 链路级失败的哨兵：连不上（超时/拒绝/握手失败）。与状态码错误
+/// （认证/404/空间不足…）分开——只有链路失败才值得换一条出网路径重试，
+/// 认证失败换一条路结果不会变。
+class _WebDAVNetError implements Exception {}
+
+/// 服务器给了明确状态码但不属于 2xx。穿透 _withFallback 时不得触发降级。
+class _WebDAVStatusError implements Exception {
+  final WebDAVError err;
+  _WebDAVStatusError(this.err);
+}
+
 class WebDAVClient {
   static const defaultDirectory = 'EchOS_Backup';
   static const fileName = 'EchOS-config.json';
@@ -61,45 +72,128 @@ class WebDAVClient {
     }
   }
 
+  // ---- 出网路径（2026-10-18 修复「WebDAV 备份：网络不通」）----
+  //
+  // 旧实现用裸 HttpClient，而 Dart 的 HttpClient 默认**不走系统代理**——
+  // 它永远直连。WebDAV 目标若直连被掐（实测：TLS 握手 0.4s fast-fail），
+  // 只有经隧道可达，就会出现「浏览器开着代理一切正常、客户端备份永远
+  // 网络不通」：kernel.log 里该域名零出现，因为请求根本没进过隧道。
+  //
+  // 修法与 updater._client 同构：先走系统代理——隧道开着时它就是自己的
+  // 本地入站，这条请求进内核后照样吃分流（国内目标直连、国外走隧道，
+  // 客户端自己不该另立一套分流判断）；隧道关着时它是用户原有的代理
+  // 设置。链路失败降级直连再试一次（对齐 updater._getBody 的两段循环）。
+  // 降级只认 _WebDAVNetError，状态码错误原样上报。
+  //
+  // _systemProxyAddr 与 updater.dart 的同名函数同构（注册表读系统代理）。
+  // 这类读取在 updater / license_service / 这里已有三份，语义各有微差
+  // （license 那份带缓存），合并进整理清单，不在本次顺手改。
+  static String? _systemProxyAddr() {
+    try {
+      final r1 = Process.runSync('reg', [
+        'query',
+        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
+        '/v', 'ProxyEnable',
+      ], runInShell: true);
+      if (!(r1.stdout as String).contains('0x1')) return null;
+      final r2 = Process.runSync('reg', [
+        'query',
+        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
+        '/v', 'ProxyServer',
+      ], runInShell: true);
+      String v = '';
+      for (final l in (r2.stdout as String).split('\n')) {
+        if (l.contains('REG_SZ')) {
+          v = l.split('REG_SZ').last.trim();
+          break;
+        }
+      }
+      return v.isEmpty ? null : v;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static HttpClient _client(String? proxy) {
+    final c = HttpClient()..connectionTimeout = const Duration(seconds: 12);
+    c.findProxy = (uri) => proxy == null ? 'DIRECT' : 'PROXY $proxy';
+    return c;
+  }
+
+  /// 出网路径顺序（2026-10-18 用户口径终版）：**直连永远第一**——原本正常
+  /// 的体验必须零改变；直连链路失败才降级：先自家隧道入站（应用在跑就存在，
+  /// 不依赖系统代理开关——域名被 SNI 阻断这类环境问题由此无感解决），再系统
+  /// 代理（第三方代理用户），最后放弃。状态码错误（认证/404…）原样穿透，
+  /// 不触发换路。
+  ///
+  /// 契约：成功返回值；状态码错误抛 _WebDAVStatusError；所有候选路径的链路
+  /// 都失败时向外抛 _WebDAVNetError，由调用方翻译成「网络不通」文案。
+  ///
+  /// 本地 HTTP 入站固定 30001（与 SOCKS 30000 一对，见 app_state.dart 581 行
+  /// 注释）；隧道没跑时该端口没人听，连接立刻被拒——等同跳过，零等待。
+  /// 所以这里不查 AppState.isRunning，直接把候选列上：端口探测的成本远低于
+  /// 一次状态竞态（备份发起的瞬间内核可能正在重启）。
+  static List<String?> _candidateProxies() {
+    final sys = _systemProxyAddr();
+    return [null, '127.0.0.1:30001', ?sys];
+  }
+
+  static Future<T> _withFallback<T>(Future<T> Function(HttpClient c) op) async {
+    for (final proxy in _candidateProxies()) {
+      final c = _client(proxy);
+      try {
+        return await op(c);
+      } on _WebDAVNetError {
+        continue;
+      }
+    }
+    throw _WebDAVNetError();
+  }
+
   static Future<WebDAVError?> upload(
       String url, String username, String password, String body) async {
-    final err = await _mkcol(url, username, password);
-    if (err != null) return err;
     try {
-      final req = HttpClient().putUrl(Uri.parse(url));
-      final r = await req;
-      r.headers.contentType = ContentType.json;
-      _auth(r, username, password);
-      r.write(body);
-      final resp = await r.close();
-      return _statusError(resp.statusCode);
-    } catch (_) {
+      return await _withFallback<WebDAVError?>((c) async {
+        try {
+          await _mkcol(c, url, username, password);
+          final r = await c.putUrl(Uri.parse(url));
+          r.headers.contentType = ContentType.json;
+          _auth(r, username, password);
+          r.write(body);
+          final resp = await r.close();
+          final err = _statusError(resp.statusCode);
+          if (err != null) throw _WebDAVStatusError(err);
+          return null;
+        } on _WebDAVStatusError {
+          rethrow;
+        } catch (_) {
+          throw _WebDAVNetError();
+        }
+      });
+    } on _WebDAVStatusError catch (e) {
+      return e.err;
+    } on _WebDAVNetError {
       return WebDAVError('网络不通：无法连接到服务器（检查网络或地址）');
     }
   }
 
   /// 逐级 MKCOL 创建目标目录。目录已存在（405）或父级不存在重试时容忍；
-  /// 返回 null 表示目录可用（已存在或创建成功）。
-  static Future<WebDAVError?> _mkcol(
-      String fileUrl, String username, String password) async {
+  /// 返回 null 表示目录可用（已存在或创建成功）。状态码错误以
+  /// _WebDAVStatusError 抛出，链路失败以 _WebDAVNetError 抛出。
+  static Future<WebDAVError?> _mkcol(HttpClient client, String fileUrl,
+      String username, String password) async {
     final u = Uri.parse(fileUrl);
-    try {
-      final client = HttpClient();
-      var path = u.path;
-      final parts = path.split('/').where((s) => s.isNotEmpty).toList();
-      if (parts.isEmpty || parts.length < 2) return null; // 根目录或只有文件名
-      parts.removeLast(); // 去掉文件名，剩下各级目录
-      var acc = <String>[];
-      for (final seg in parts) {
-        acc.add(seg);
-        final dirUrl = u.replace(path: '/${acc.join('/')}/').toString();
-        final err = await _mkcolOne(client, dirUrl, username, password);
-        if (err != null) return err;
-      }
-      return null;
-    } catch (_) {
-      return WebDAVError('网络不通：无法连接到服务器（检查网络或地址）');
+    final parts = u.path.split('/').where((s) => s.isNotEmpty).toList();
+    if (parts.isEmpty || parts.length < 2) return null; // 根目录或只有文件名
+    parts.removeLast(); // 去掉文件名，剩下各级目录
+    final acc = <String>[];
+    for (final seg in parts) {
+      acc.add(seg);
+      final dirUrl = u.replace(path: '/${acc.join('/')}/').toString();
+      final err = await _mkcolOne(client, dirUrl, username, password);
+      if (err != null) throw _WebDAVStatusError(err);
     }
+    return null;
   }
 
   static Future<WebDAVError?> _mkcolOne(HttpClient client, String url,
@@ -116,25 +210,34 @@ class WebDAVClient {
       // 404 = 父目录尚未创建，也容忍（继续上传时客户端可能仍有问题，但至少不因 MKCOL 中断）。
       if (code == 404) return null;
       return _statusError(code);
+    } on _WebDAVStatusError {
+      rethrow;
     } catch (_) {
-      return WebDAVError('网络不通：无法连接到服务器（检查网络或地址）');
+      throw _WebDAVNetError();
     }
   }
 
   static Future<String?> download(
       String url, String username, String password, {WebDAVError? outErr}) async {
     try {
-      final req = HttpClient().getUrl(Uri.parse(url));
-      final r = await req;
-      _auth(r, username, password);
-      final resp = await r.close();
-      final err = _statusError(resp.statusCode);
-      if (err != null) {
-        if (outErr != null) outErr.message = err.message;
-        return null;
-      }
-      return await resp.transform(utf8.decoder).join();
-    } catch (_) {
+      return await _withFallback<String?>((c) async {
+        try {
+          final r = await c.getUrl(Uri.parse(url));
+          _auth(r, username, password);
+          final resp = await r.close();
+          final err = _statusError(resp.statusCode);
+          if (err != null) throw _WebDAVStatusError(err);
+          return await resp.transform(utf8.decoder).join();
+        } on _WebDAVStatusError {
+          rethrow;
+        } catch (_) {
+          throw _WebDAVNetError();
+        }
+      });
+    } on _WebDAVStatusError catch (e) {
+      if (outErr != null) outErr.message = e.err.message;
+      return null;
+    } on _WebDAVNetError {
       if (outErr != null) {
         outErr.message = '网络不通：无法连接到服务器（检查网络或地址）';
       }
@@ -146,13 +249,24 @@ class WebDAVClient {
   static Future<WebDAVError?> delete(
       String url, String username, String password) async {
     try {
-      final req = HttpClient().deleteUrl(Uri.parse(url));
-      final r = await req;
-      _auth(r, username, password);
-      final resp = await r.close();
-      if (resp.statusCode == 404) return null;
-      return _statusError(resp.statusCode);
-    } catch (_) {
+      return await _withFallback<WebDAVError?>((c) async {
+        try {
+          final r = await c.deleteUrl(Uri.parse(url));
+          _auth(r, username, password);
+          final resp = await r.close();
+          if (resp.statusCode == 404) return null;
+          final err = _statusError(resp.statusCode);
+          if (err != null) throw _WebDAVStatusError(err);
+          return null;
+        } on _WebDAVStatusError {
+          rethrow;
+        } catch (_) {
+          throw _WebDAVNetError();
+        }
+      });
+    } on _WebDAVStatusError catch (e) {
+      return e.err;
+    } on _WebDAVNetError {
       return WebDAVError('网络不通：无法连接到服务器（检查网络或地址）');
     }
   }
