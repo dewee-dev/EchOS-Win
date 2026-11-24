@@ -24,8 +24,22 @@ jobs:
     env:
       # push 事件下 inputs 上下文不可用，必须走 event.inputs
       APP_VERSION: ${{ github.event_name == 'push' && github.ref_name || (github.event.inputs.app_version != '' && github.event.inputs.app_version || 'dev') }}
+      # secret 通过 env 传递，不直接插值进 PowerShell 脚本：
+      # 值中的单引号会破坏 '...' 字面量，甚至造成命令注入。
+      ECHOS_LICENSE_URL: ${{ secrets.ECHOS_LICENSE_URL }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: 校验发布参数
+        shell: pwsh
+        run: |
+          $isRelease = '${{ github.event_name }}' -eq 'push' -or `
+                       '${{ github.event.inputs.publish_release }}' -eq 'true'
+          if ($isRelease -and $env:APP_VERSION -notmatch '^v?\d+\.\d+\.\d+$') {
+            Write-Error "发布需要语义化版本号（如 v1.3.0），当前为 '$env:APP_VERSION'。请填写 app_version 或推送 v* 标签。"
+            exit 1
+          }
+          Write-Output "APP_VERSION=$env:APP_VERSION; isRelease=$isRelease"
 
       - name: 检查历史目录名残留
         shell: pwsh
@@ -75,7 +89,7 @@ jobs:
             $args += "--dart-define=ECHOS_VERSION=$num"
             $args += "--build-name=$num"
           }
-          $lic = '${{ secrets.ECHOS_LICENSE_URL }}'
+          $lic = $env:ECHOS_LICENSE_URL
           if ($lic) {
             $args += "--dart-define=ECHOS_LICENSE_URL=$lic"
             Write-Host '授权地址已注入（来自 ECHOS_LICENSE_URL secret）'
@@ -202,10 +216,10 @@ jobs:
         run: |
           $rel = 'build/windows/x64/runner/Release'
           $num = ''
-          if ($env:APP_VERSION -match '^v?(\d+\.\d+\.\d+)$') { $num = $Matches[1] }
+          if ($env:APP_VERSION -match '^v?(\d+\.\d+\.\d+)(?:[+-].*)?$') { $num = $Matches[1] }
 
           # 正式发版（tag 构建）没有授权地址 = 发出去一个拦不住人的包
-          $lic = '${{ secrets.ECHOS_LICENSE_URL }}'
+          $lic = $env:ECHOS_LICENSE_URL
           if (-not $lic -and '${{ github.ref_type }}' -eq 'tag') {
             Write-Error '正式发版（tag 构建）未配置 ECHOS_LICENSE_URL secret——拒绝产出无激活门的发布包。'
             exit 1
@@ -277,9 +291,10 @@ jobs:
         run: |
           $wfFile = ([IO.Path]::GetFileName('${{ github.workflow_ref }}'.Split('@')[0]))
           $json = gh run list --workflow $wfFile --limit 50 --json databaseId,status --jq '[.[] | select(.status == "completed") | .databaseId]'
-          $ids = $json | ConvertFrom-Json
+          # 只有 1 条时 ConvertFrom-Json 返回标量，@() 强制数组语义，避免切片出错
+          $ids = @($json | ConvertFrom-Json)
           if ($ids.Count -gt 1) {
-            $drop = $ids[1..($ids.Count - 1)]
+            $drop = @($ids[1..($ids.Count - 1)])
           } else {
             $drop = @()
           }
