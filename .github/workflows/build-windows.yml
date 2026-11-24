@@ -202,6 +202,11 @@ jobs:
           } else {
             Write-Warning '未取得 ResourceHacker，便携版沿用 SFX 默认图标与版本信息（不影响功能）'
           }
+          # ResourceHacker 是可选增强：angusj.com 下载失败或 choco 源无此包时，
+          # 上面的 choco/$rh 调用会把 $LASTEXITCODE 置为 1。PowerShell 脚本以
+          # 最后一条外部命令的退出码结束，导致整个发版被可选步骤拖垮。
+          # 此处显式归零；必需的归档拼接在下方，其失败仍会正常抛错退出。
+          $LASTEXITCODE = 0
           $out = Join-Path (Get-Location) "Output\EchOS-Win-$ver-x64-Portable.exe"
           $parts = @($sfx, 'installer/portable-config.txt', "$env:TEMP\portable.7z")
           $fs = [IO.File]::Create($out)
