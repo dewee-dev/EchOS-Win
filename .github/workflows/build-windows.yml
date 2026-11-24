@@ -166,13 +166,23 @@ jobs:
           Invoke-WebRequest 'https://raw.githubusercontent.com/OlegScherbakov/7zSFX/master/files/7zsd_extra_170_3900.7z' -OutFile "$env:TEMP\7zsd.7z"
           & $7z x "$env:TEMP\7zsd.7z" -o"$env:TEMP\7zsd" -y | Out-Null
           $sfx = "$env:TEMP\7zsd\7zsd_LZMA2_x64.sfx"
+          # 查找顺序与本地 build_local.ps1 对齐：仓库内置 tools/ 优先。
+          # angusj.com 官方包当前返回 406、choco 源无此包，外部获取已不可靠；
+          # 仓库内置副本是稳定来源（本地构建也认同一路径）。
           $rh = $null
-          try {
-            Invoke-WebRequest 'https://www.angusj.com/resourcehacker/resource_hacker.zip' -OutFile "$env:TEMP\reshacker.zip"
-            & $7z x "$env:TEMP\reshacker.zip" -o"$env:TEMP\reshacker" -y | Out-Null
-            $rh = "$env:TEMP\reshacker\ResourceHacker.exe"
-          } catch {
-            Write-Output 'angusj.com 下载失败，回退到 choco 安装 ResourceHacker'
+          $repoRh = 'tools/ResourceHacker.exe'
+          if (Test-Path $repoRh) {
+            $rh = (Resolve-Path $repoRh).Path
+            Write-Output "使用仓库内置 ResourceHacker -> $rh"
+          }
+          if (-not ($rh -and (Test-Path $rh))) {
+            try {
+              Invoke-WebRequest 'https://www.angusj.com/resourcehacker/resource_hacker.zip' -OutFile "$env:TEMP\reshacker.zip"
+              & $7z x "$env:TEMP\reshacker.zip" -o"$env:TEMP\reshacker" -y | Out-Null
+              $rh = "$env:TEMP\reshacker\ResourceHacker.exe"
+            } catch {
+              Write-Output 'angusj.com 下载失败，回退到 choco 安装 ResourceHacker'
+            }
           }
           if (-not ($rh -and (Test-Path $rh))) {
             choco install resourcehacker -y --no-progress
